@@ -63,4 +63,5 @@ dependencies {
 
     // Accompanist: Makes asking for permissions in Compose much easier
     implementation("com.google.accompanist:accompanist-permissions:0.37.3")
+
 }

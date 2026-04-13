@@ -1,126 +1,173 @@
 package com.example.bleapp
 
+import android.R
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import okhttp3.*
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
-import java.io.IOException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import java.lang.StringBuilder
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
 
 class BleBackgroundService : Service() {
 
     private lateinit var bleManager: NiclaBleManager
-    private val client = OkHttpClient()
-    private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
-    private val CHANNEL_ID = "BleServiceChannel"
+    private val dataBuffer = StringBuilder()
 
-    private var dataBuffer = StringBuilder()
+    // --- NEW: THE BLUETOOTH TOGGLE LISTENER ---
+    private val bluetoothStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
+                val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+
+                if (state == BluetoothAdapter.STATE_ON) {
+                    Log.d("BleService", "User turned Bluetooth ON. Forcing reconnect...")
+                    connectToNicla() // Restart the connection engine!
+                } else if (state == BluetoothAdapter.STATE_OFF) {
+                    Log.d("BleService", "User turned Bluetooth OFF. Going to sleep...")
+                }
+            }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
         bleManager = NiclaBleManager(this)
 
-        bleManager.onDataReceived = { data ->
-            Log.d("BleService", "Nicla says: $data")
+        // Register our Bluetooth Toggle Listener
+        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        registerReceiver(bluetoothStateReceiver, filter)
+
+        val prefs = getSharedPreferences("NiclaPrefs", MODE_PRIVATE)
+
+        bleManager.onDataReceived = { bytes ->
+            val rawMac = prefs.getString("PAIRED_MAC", "Unknown_Device") ?: "Unknown_Device"
+            val deviceId = rawMac.replace(":", "_")
+            val textRepresentation = String(bytes, Charsets.UTF_8)
 
             when {
-                data == "START" -> {
-                    dataBuffer.clear()
+                textRepresentation == "START" -> { dataBuffer.clear() }
+                textRepresentation.startsWith("END:") -> {
+                    val totalSteps = textRepresentation.substringAfter("END:")
+                    sendDataToGoogleNative(deviceId, totalSteps, dataBuffer.toString())
                 }
-                data.startsWith("END:") -> {
-                    val totalSteps = data.substringAfter("END:")
-                    sendDataToWeb("User_01", totalSteps, dataBuffer.toString())
-                }
-                data.startsWith("BATT:") -> {
-                    val battLevel = data.substringAfter("BATT:")
-                    sendDataToWeb("User_01_Battery", battLevel, "")
+                textRepresentation.startsWith("BATT:") -> {
+                    val battLevel = textRepresentation.substringAfter("BATT:")
+                    sendDataToGoogleNative("${deviceId}_Battery", battLevel, "")
                 }
                 else -> {
-                    dataBuffer.append(data)
+                    for (byte in bytes) {
+                        val stepsInMinute = byte.toInt() and 0xFF
+                        dataBuffer.append("$stepsInMinute,")
+                    }
                 }
             }
         }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Nicla Link Active")
-            .setContentText("Running in background to stream data.")
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+        if (intent?.action == "ACTION_STOP_SERVICE") {
+            bleManager.disconnect().enqueue()
+            bleManager.close()
+            stopForeground(true)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        val notification = NotificationCompat.Builder(this, "NICLA_CHANNEL")
+            .setContentTitle("Nicla Tracker Active")
+            .setContentText("Listening for data in background...")
+            .setSmallIcon(R.drawable.ic_dialog_info)
             .build()
 
         startForeground(1, notification)
 
-        val prefs = getSharedPreferences("NiclaPrefs", Context.MODE_PRIVATE)
-        val savedAddress = prefs.getString("PAIRED_MAC", "")
+        // Start the initial connection
+        connectToNicla()
 
-        val deviceAddress = intent?.getStringExtra("DEVICE_ADDRESS") ?: savedAddress
-
-        if (!deviceAddress.isNullOrEmpty()) {
-            val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-            val device = bluetoothManager.adapter.getRemoteDevice(deviceAddress)
-
-            // This handles the "Out of Range / In Range" magic perfectly
-            bleManager.connect(device)
-                .retry(3, 100)
-                .useAutoConnect(true)
-                .enqueue()
-        } else {
-            // If there's no MAC address saved anywhere, stop the service.
-            stopSelf()
-        }
-
-        return START_STICKY // Tells Android to restart this service if it gets killed
+        return START_STICKY
     }
 
-    private fun sendDataToWeb(userId: String, totalSteps: String, csvData: String) {
-        val prefs = getSharedPreferences("NiclaPrefs", Context.MODE_PRIVATE)
-        val url = prefs.getString("WEBHOOK_URL", "") ?: ""
+    // --- NEW: EXTRACTED CONNECTION LOGIC ---
+    private fun connectToNicla() {
+        val prefs = getSharedPreferences("NiclaPrefs", MODE_PRIVATE)
+        val savedMac = prefs.getString("PAIRED_MAC", null)
 
-        if (url.isEmpty() || !url.startsWith("http")) return
+        if (savedMac != null && savedMac.length == 17) {
+            val bluetoothManager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
+            val adapter = bluetoothManager.adapter
 
-        val jsonPayload = """
-            {
-                "user_id": "$userId", 
-                "total_steps": "$totalSteps", 
-                "csv_data": "$csvData"
+            // Only try to connect if the physical Bluetooth radio is actually ON
+            if (adapter != null && adapter.isEnabled) {
+                try {
+                    val device = adapter.getRemoteDevice(savedMac)
+                    bleManager.connect(device)
+                        .retry(3, 100)
+                        .useAutoConnect(true)
+                        .enqueue()
+                    Log.d("BleService", "Auto-Connect engine started for $savedMac")
+                } catch (e: Exception) {
+                    Log.e("BleService", "Error connecting: ${e.message}")
+                }
             }
-        """.trimIndent()
+        }
+    }
 
-        val body = jsonPayload.toRequestBody(jsonMediaType)
-        val request = Request.Builder().url(url).post(body).build()
+    private fun sendDataToGoogleNative(sheetName: String, steps: String, csv: String) {
+        val prefs = getSharedPreferences("NiclaPrefs", MODE_PRIVATE)
+        val webhookUrl = prefs.getString("SERVER_URL", "") ?: return
+        if (webhookUrl.isEmpty()) return
 
-        client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                Log.e("BleService", "HTTP Fail: ${e.message}")
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val url = URL(webhookUrl)
+                val connection = url.openConnection() as HttpURLConnection
+                connection.requestMethod = "POST"
+                connection.doOutput = true
+
+                val postData = "sheetName=${URLEncoder.encode(sheetName, "UTF-8")}" +
+                        "&steps=${URLEncoder.encode(steps, "UTF-8")}" +
+                        "&logData=${URLEncoder.encode(csv, "UTF-8")}"
+
+                val bytes = postData.toByteArray(Charsets.UTF_8)
+                connection.setRequestProperty("Content-Length", bytes.size.toString())
+                connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+
+                connection.outputStream.write(bytes)
+                val responseCode = connection.responseCode
+                Log.d("BleService", "Google Received Data! HTTP Code: $responseCode")
+                connection.disconnect()
+            } catch (e: Exception) {
+                Log.e("BleService", "Native Network Error: ${e.message}")
             }
-            override fun onResponse(call: Call, response: Response) {
-                Log.d("BleService", "Success: Daily CSV row added to Google!")
-                response.close()
-            }
-        })
+        }
     }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(CHANNEL_ID, "BLE Background", NotificationManager.IMPORTANCE_LOW)
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
+            val channel = NotificationChannel("NICLA_CHANNEL", "Nicla Sync", NotificationManager.IMPORTANCE_LOW)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        bleManager.disconnect().enqueue()
+        // Clean up our listener so the app doesn't leak memory!
+        unregisterReceiver(bluetoothStateReceiver)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
