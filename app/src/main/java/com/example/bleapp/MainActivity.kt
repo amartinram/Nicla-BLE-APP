@@ -23,6 +23,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.ViewModelProvider
 
 class MainActivity : ComponentActivity() {
 
@@ -34,11 +35,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        viewModel = MainViewModel(this)
+
+        // Safely initialize AndroidViewModel
+        viewModel = ViewModelProvider(this)[MainViewModel::class.java]
 
         requestPermissions()
 
-        // --- 1. THE "RUN ONCE" CHECK ---
         val prefs = getSharedPreferences("NiclaPrefs", Context.MODE_PRIVATE)
         val isFirstRun = prefs.getBoolean("IS_FIRST_RUN", true)
 
@@ -71,7 +73,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun runFirstTimeSetup() {
-        // 1. Standard Android Battery Exemption
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         if (!powerManager.isIgnoringBatteryOptimizations(packageName)) {
             try {
@@ -84,16 +85,12 @@ class MainActivity : ComponentActivity() {
                 Log.e("MainActivity", "Battery exemption intent failed: ${e.message}")
             }
         }
-
-        // 2. The Universal OEM Autostart Bypass
         requestUniversalAutoStart()
     }
 
-    // --- 2. THE UNIVERSAL OEM BYPASS ---
     private fun requestUniversalAutoStart() {
         val manufacturer = Build.MANUFACTURER.lowercase()
         val intent = Intent()
-
         try {
             when (manufacturer) {
                 "xiaomi", "redmi", "poco" -> {
@@ -111,15 +108,10 @@ class MainActivity : ComponentActivity() {
                 "huawei", "honor" -> {
                     intent.component = ComponentName("com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity")
                 }
-                else -> {
-                    // If it's a Pixel, Motorola, Sony, etc., standard Android handles it.
-                    Log.d("MainActivity", "Standard Android detected. No OEM Autostart needed.")
-                    return
-                }
+                else -> return
             }
             startActivity(intent)
         } catch (e: Exception) {
-            // Fails silently if the user's specific OS version moved the menu
             Log.e("MainActivity", "Failed to open OEM autostart for $manufacturer: ${e.message}")
         }
     }
@@ -136,12 +128,12 @@ fun TrackerScreen(viewModel: MainViewModel) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        Text("Nicla Tracker Setup", fontSize = 28.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 32.dp))
+        Text("Nicla App", fontSize = 28.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 32.dp))
 
         OutlinedTextField(
             value = serverUrl,
             onValueChange = { viewModel.setServerUrl(it) },
-            label = { Text("Webhook URL") },
+            label = { Text("URL servidor") },
             modifier = Modifier.fillMaxWidth(),
             enabled = !isTracking
         )
@@ -151,7 +143,7 @@ fun TrackerScreen(viewModel: MainViewModel) {
         OutlinedTextField(
             value = macAddress,
             onValueChange = { viewModel.setMacAddress(it) },
-            label = { Text("MAC Address (AA:BB:CC:DD:EE:FF)") },
+            label = { Text("Direccion dispositivo Nicla (AA:BB:CC:DD:EE:FF)") },
             modifier = Modifier.fillMaxWidth(),
             enabled = !isTracking
         )
@@ -160,7 +152,7 @@ fun TrackerScreen(viewModel: MainViewModel) {
 
         if (!isTracking) {
             Button(onClick = { viewModel.startTracking() }, modifier = Modifier.fillMaxWidth().height(56.dp)) {
-                Text("Save, Pair & Start", fontSize = 16.sp)
+                Text("Guardar y Conectar", fontSize = 16.sp)
             }
         } else {
             Button(
@@ -168,7 +160,7 @@ fun TrackerScreen(viewModel: MainViewModel) {
                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                 modifier = Modifier.fillMaxWidth().height(56.dp)
             ) {
-                Text("Unpair & Stop Tracker", fontSize = 16.sp, color = MaterialTheme.colorScheme.onError)
+                Text("Desconectar", fontSize = 16.sp, color = MaterialTheme.colorScheme.onError)
             }
         }
     }

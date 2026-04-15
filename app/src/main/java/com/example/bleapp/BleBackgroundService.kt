@@ -1,6 +1,5 @@
 package com.example.bleapp
 
-import android.R
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
@@ -16,28 +15,41 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import java.lang.StringBuilder
-import java.net.HttpURLConnection
-import java.net.URL
-import java.net.URLEncoder
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import okhttp3.FormBody
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.util.concurrent.TimeUnit
 
 class BleBackgroundService : Service() {
 
     private lateinit var bleManager: NiclaBleManager
-    private val dataBuffer = StringBuilder()
 
-    // --- NEW: THE BLUETOOTH TOGGLE LISTENER ---
+    private val packetMutex = Mutex()
+    private val dataBuffer = mutableListOf<Int>()
+    private var expectedBytes = 0
+    private var receivedBytes = 0
+    private var currentTotalSteps = 0L
+
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .build()
+
     private val bluetoothStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
                 val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
-
                 if (state == BluetoothAdapter.STATE_ON) {
-                    Log.d("BleService", "User turned Bluetooth ON. Forcing reconnect...")
-                    connectToNicla() // Restart the connection engine!
-                } else if (state == BluetoothAdapter.STATE_OFF) {
-                    Log.d("BleService", "User turned Bluetooth OFF. Going to sleep...")
+                    Log.d("BleService", "Bluetooth ON. Reconnecting...")
+                    connectToNicla()
                 }
             }
         }
@@ -48,31 +60,53 @@ class BleBackgroundService : Service() {
         createNotificationChannel()
         bleManager = NiclaBleManager(this)
 
-        // Register our Bluetooth Toggle Listener
-        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
-        registerReceiver(bluetoothStateReceiver, filter)
+        registerReceiver(bluetoothStateReceiver, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED))
 
         val prefs = getSharedPreferences("NiclaPrefs", MODE_PRIVATE)
 
         bleManager.onDataReceived = { bytes ->
             val rawMac = prefs.getString("PAIRED_MAC", "Unknown_Device") ?: "Unknown_Device"
             val deviceId = rawMac.replace(":", "_")
-            val textRepresentation = String(bytes, Charsets.UTF_8)
 
-            when {
-                textRepresentation == "START" -> { dataBuffer.clear() }
-                textRepresentation.startsWith("END:") -> {
-                    val totalSteps = textRepresentation.substringAfter("END:")
-                    sendDataToGoogleNative(deviceId, totalSteps, dataBuffer.toString())
-                }
-                textRepresentation.startsWith("BATT:") -> {
-                    val battLevel = textRepresentation.substringAfter("BATT:")
-                    sendDataToGoogleNative("${deviceId}_Battery", battLevel, "")
-                }
-                else -> {
-                    for (byte in bytes) {
-                        val stepsInMinute = byte.toInt() and 0xFF
-                        dataBuffer.append("$stepsInMinute,")
+            serviceScope.launch {
+
+                packetMutex.withLock {
+
+                    if (bytes.size == 9 && bytes[0] == 0xAA.toByte() && bytes[1] == 0xBB.toByte()) {
+
+                        expectedBytes = ((bytes[2].toInt() and 0xFF) shl 8) or (bytes[3].toInt() and 0xFF)
+
+                        currentTotalSteps = ((bytes[4].toLong() and 0xFF) shl 24) or
+                                ((bytes[5].toLong() and 0xFF) shl 16) or
+                                ((bytes[6].toLong() and 0xFF) shl 8) or
+                                (bytes[7].toLong() and 0xFF)
+
+                        val battLevel = bytes[8].toInt() and 0xFF
+
+                        dataBuffer.clear()
+                        receivedBytes = 0
+
+                        sendDataToGoogle("${deviceId}_Battery", battLevel.toString(), "")
+                        Log.d("BleService", "Header received. Expecting $expectedBytes bytes of data.")
+                    }
+
+                    else {
+                        for (byte in bytes) {
+                            dataBuffer.add(byte.toInt() and 0xFF)
+                            receivedBytes++
+                        }
+
+
+                        if (receivedBytes >= expectedBytes && expectedBytes > 0) {
+                            Log.d("BleService", "Payload complete. Sending to Webhook.")
+
+                            val csv = dataBuffer.joinToString(",")
+                            sendDataToGoogle(deviceId, currentTotalSteps.toString(), csv)
+
+                            expectedBytes = 0
+                            receivedBytes = 0
+                            dataBuffer.clear()
+                        }
                     }
                 }
             }
@@ -83,7 +117,7 @@ class BleBackgroundService : Service() {
         if (intent?.action == "ACTION_STOP_SERVICE") {
             bleManager.disconnect().enqueue()
             bleManager.close()
-            stopForeground(true)
+            stopForeground(Service.STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
         }
@@ -91,18 +125,15 @@ class BleBackgroundService : Service() {
         val notification = NotificationCompat.Builder(this, "NICLA_CHANNEL")
             .setContentTitle("Nicla Tracker Active")
             .setContentText("Listening for data in background...")
-            .setSmallIcon(R.drawable.ic_dialog_info)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
             .build()
 
         startForeground(1, notification)
-
-        // Start the initial connection
         connectToNicla()
 
         return START_STICKY
     }
 
-    // --- NEW: EXTRACTED CONNECTION LOGIC ---
     private fun connectToNicla() {
         val prefs = getSharedPreferences("NiclaPrefs", MODE_PRIVATE)
         val savedMac = prefs.getString("PAIRED_MAC", null)
@@ -111,7 +142,6 @@ class BleBackgroundService : Service() {
             val bluetoothManager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
             val adapter = bluetoothManager.adapter
 
-            // Only try to connect if the physical Bluetooth radio is actually ON
             if (adapter != null && adapter.isEnabled) {
                 try {
                     val device = adapter.getRemoteDevice(savedMac)
@@ -119,7 +149,6 @@ class BleBackgroundService : Service() {
                         .retry(3, 100)
                         .useAutoConnect(true)
                         .enqueue()
-                    Log.d("BleService", "Auto-Connect engine started for $savedMac")
                 } catch (e: Exception) {
                     Log.e("BleService", "Error connecting: ${e.message}")
                 }
@@ -127,32 +156,26 @@ class BleBackgroundService : Service() {
         }
     }
 
-    private fun sendDataToGoogleNative(sheetName: String, steps: String, csv: String) {
+    private fun sendDataToGoogle(sheetName: String, steps: String, csv: String) {
         val prefs = getSharedPreferences("NiclaPrefs", MODE_PRIVATE)
         val webhookUrl = prefs.getString("SERVER_URL", "") ?: return
         if (webhookUrl.isEmpty()) return
 
-        CoroutineScope(Dispatchers.IO).launch {
+        serviceScope.launch {
             try {
-                val url = URL(webhookUrl)
-                val connection = url.openConnection() as HttpURLConnection
-                connection.requestMethod = "POST"
-                connection.doOutput = true
+                val body = FormBody.Builder()
+                    .add("sheetName", sheetName)
+                    .add("steps", steps)
+                    .add("logData", csv)
+                    .build()
 
-                val postData = "sheetName=${URLEncoder.encode(sheetName, "UTF-8")}" +
-                        "&steps=${URLEncoder.encode(steps, "UTF-8")}" +
-                        "&logData=${URLEncoder.encode(csv, "UTF-8")}"
+                val request = Request.Builder().url(webhookUrl).post(body).build()
 
-                val bytes = postData.toByteArray(Charsets.UTF_8)
-                connection.setRequestProperty("Content-Length", bytes.size.toString())
-                connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-
-                connection.outputStream.write(bytes)
-                val responseCode = connection.responseCode
-                Log.d("BleService", "Google Received Data! HTTP Code: $responseCode")
-                connection.disconnect()
+                httpClient.newCall(request).execute().use { response ->
+                    Log.d("BleService", "Google HTTP Code: ${response.code}")
+                }
             } catch (e: Exception) {
-                Log.e("BleService", "Native Network Error: ${e.message}")
+                Log.e("BleService", "Network Error: ${e.message}")
             }
         }
     }
@@ -166,7 +189,7 @@ class BleBackgroundService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        // Clean up our listener so the app doesn't leak memory!
+        serviceScope.cancel()
         unregisterReceiver(bluetoothStateReceiver)
     }
 

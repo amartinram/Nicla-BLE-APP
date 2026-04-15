@@ -16,8 +16,6 @@ class BootReceiver : BroadcastReceiver() {
 
             Log.d("BootReceiver", "Boot broadcast received! Action: $action")
 
-            // CRITICAL: We must use Device Protected Storage to read the MAC address
-            // if the user hasn't typed their PIN code yet!
             val deviceContext = ContextCompat.createDeviceProtectedStorageContext(context) ?: context
             val prefs = deviceContext.getSharedPreferences("NiclaPrefs", Context.MODE_PRIVATE)
             val savedMac = prefs.getString("PAIRED_MAC", null)

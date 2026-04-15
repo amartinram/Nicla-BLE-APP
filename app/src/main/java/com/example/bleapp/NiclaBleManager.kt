@@ -3,6 +3,7 @@ package com.example.bleapp
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCharacteristic
 import android.content.Context
+import android.util.Log
 import no.nordicsemi.android.ble.BleManager
 import java.util.UUID
 
@@ -23,7 +24,10 @@ class NiclaBleManager(context: Context) : BleManager(context) {
     }
 
     override fun initialize() {
-        requestMtu(512).enqueue()
+        requestMtu(512).with { _, mtu ->
+            Log.d("NiclaBleManager", "Negotiated MTU: $mtu")
+        }.enqueue()
+
         val characteristic = dataCharacteristic ?: return
 
         setNotificationCallback(characteristic).with { _, data ->
