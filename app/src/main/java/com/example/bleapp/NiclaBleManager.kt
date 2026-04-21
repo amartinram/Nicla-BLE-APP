@@ -36,6 +36,13 @@ class NiclaBleManager(context: Context) : BleManager(context) {
         enableNotifications(characteristic).enqueue()
     }
 
+    fun sendAck() {
+        dataCharacteristic?.let { char ->
+            writeCharacteristic(char, byteArrayOf(0xCC.toByte()), BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT).enqueue()
+            Log.d("NiclaBleManager", "Sent 0xCC ACK to Nicla")
+        }
+    }
+
     override fun onServicesInvalidated() {
         dataCharacteristic = null
     }

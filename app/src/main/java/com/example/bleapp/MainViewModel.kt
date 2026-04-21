@@ -14,7 +14,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _serverUrl = MutableStateFlow(prefs.getString("SERVER_URL", "") ?: "")
     val serverUrl = _serverUrl.asStateFlow()
-    
+
     private val _macAddress = MutableStateFlow(
         prefs.getString("PAIRED_MAC", prefs.getString("SAVED_MAC", "")) ?: ""
     )
