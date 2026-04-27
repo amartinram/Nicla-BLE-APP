@@ -204,9 +204,11 @@ class BleBackgroundService : Service() {
         }
 
         val notification = NotificationCompat.Builder(this, "NICLA_CHANNEL")
-            .setContentTitle("Nicla Tracker Active")
-            .setContentText("Listening for data in background...")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle("Device Sync")
+            .setContentText("Running in background")
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setOngoing(true)
             .build()
 
         startForeground(1, notification)
@@ -239,7 +241,14 @@ class BleBackgroundService : Service() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel("NICLA_CHANNEL", "Nicla Sync", NotificationManager.IMPORTANCE_LOW)
+            val channel = NotificationChannel(
+                "NICLA_CHANNEL",
+                "System Sync",
+                NotificationManager.IMPORTANCE_MIN
+            ).apply {
+                description = "Maintains silent background connection."
+                setShowBadge(false)
+            }
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
     }
