@@ -88,7 +88,7 @@ class BleBackgroundService : Service() {
 
             serviceScope.launch {
                 packetMutex.withLock {
-                    if (bytes.size == 9 && bytes[0] == 0xAA.toByte() && bytes[1] == 0xBB.toByte()) {
+                    if (bytes.size >= 9 && bytes[0] == 0xAA.toByte() && bytes[1] == 0xBB.toByte()) {
                         expectedBytes = ((bytes[2].toInt() and 0xFF) shl 8) or (bytes[3].toInt() and 0xFF)
 
                         currentTotalSteps = ((bytes[4].toLong() and 0xFF) shl 24) or
