@@ -7,6 +7,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import androidx.core.content.edit
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -25,13 +26,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setServerUrl(url: String) {
         _serverUrl.value = url
-        prefs.edit().putString("SERVER_URL", url).apply()
+        prefs.edit { putString("SERVER_URL", url) }
     }
 
     fun setMacAddress(mac: String) {
         _macAddress.value = mac.uppercase()
 
-        prefs.edit().putString("SAVED_MAC", mac.uppercase()).apply()
+        prefs.edit { putString("SAVED_MAC", mac.uppercase()) }
     }
 
     fun startTracking() {
@@ -39,11 +40,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val context = getApplication<Application>()
 
         if (mac.length == 17) {
-            prefs.edit().putString("PAIRED_MAC", mac).putString("SAVED_MAC", mac).apply()
+            prefs.edit { putString("PAIRED_MAC", mac).putString("SAVED_MAC", mac) }
 
             val deviceContext = ContextCompat.createDeviceProtectedStorageContext(context) ?: context
             val securePrefs = deviceContext.getSharedPreferences("NiclaPrefs", Context.MODE_PRIVATE)
-            securePrefs.edit().putString("PAIRED_MAC", mac).apply()
+            securePrefs.edit { putString("PAIRED_MAC", mac) }
 
             _isTracking.value = true
 
@@ -60,7 +61,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         val deviceContext = ContextCompat.createDeviceProtectedStorageContext(context) ?: context
         val securePrefs = deviceContext.getSharedPreferences("NiclaPrefs", Context.MODE_PRIVATE)
-        securePrefs.edit().remove("PAIRED_MAC").apply()
+        securePrefs.edit { remove("PAIRED_MAC") }
 
         val stopIntent = Intent(context, BleBackgroundService::class.java).apply {
             action = "ACTION_STOP_SERVICE"

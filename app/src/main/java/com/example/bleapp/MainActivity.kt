@@ -1,11 +1,11 @@
 package com.example.bleapp
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
@@ -24,6 +24,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModelProvider
+import androidx.core.net.toUri
+import androidx.core.content.edit
 
 class MainActivity : ComponentActivity() {
 
@@ -46,12 +48,15 @@ class MainActivity : ComponentActivity() {
 
         if (isFirstRun) {
             runFirstTimeSetup()
-            prefs.edit().putBoolean("IS_FIRST_RUN", false).apply()
+            prefs.edit { putBoolean("IS_FIRST_RUN", false) }
         }
 
         setContent {
             MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
                     TrackerScreen(viewModel)
                 }
             }
@@ -67,18 +72,24 @@ class MainActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissions.add(Manifest.permission.POST_NOTIFICATIONS)
         }
-        if (permissions.any { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }) {
+        if (permissions.any {
+                ContextCompat.checkSelfPermission(
+                    this,
+                    it
+                ) != PackageManager.PERMISSION_GRANTED
+            }) {
             permissionLauncher.launch(permissions.toTypedArray())
         }
     }
 
+    @SuppressLint("BatteryLife")
     private fun runFirstTimeSetup() {
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         if (!powerManager.isIgnoringBatteryOptimizations(packageName)) {
             try {
                 val intent = Intent().apply {
                     action = Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
-                    data = Uri.parse("package:$packageName")
+                    data = "package:$packageName".toUri()
                 }
                 startActivity(intent)
             } catch (e: Exception) {
@@ -94,25 +105,61 @@ class MainActivity : ComponentActivity() {
         try {
             when (manufacturer) {
                 "xiaomi", "redmi", "poco" -> {
-                    intent.component = ComponentName("com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity")
+                    intent.component = ComponentName(
+                        "com.miui.securitycenter",
+                        "com.miui.permcenter.autostart.AutoStartManagementActivity"
+                    )
                 }
+
                 "samsung" -> {
-                    intent.component = ComponentName("com.samsung.android.sm_devicesecurity", "com.samsung.android.sm.ui.appscreens.AppCategoryListActivity")
+                    intent.component = ComponentName(
+                        "com.samsung.android.sm_devicesecurity",
+                        "com.samsung.android.sm.ui.appscreens.AppCategoryListActivity"
+                    )
                 }
+
                 "oppo" -> {
-                    intent.component = ComponentName("com.coloros.safecenter", "com.coloros.safecenter.permission.startup.StartupAppListActivity")
+                    intent.component = ComponentName(
+                        "com.coloros.safecenter",
+                        "com.coloros.safecenter.permission.startup.StartupAppListActivity"
+                    )
                 }
+
                 "vivo" -> {
-                    intent.component = ComponentName("com.vivo.permissionmanager", "com.vivo.permissionmanager.activity.BgStartUpManagerActivity")
+                    intent.component = ComponentName(
+                        "com.vivo.permissionmanager",
+                        "com.vivo.permissionmanager.activity.BgStartUpManagerActivity"
+                    )
                 }
+
                 "huawei", "honor" -> {
-                    intent.component = ComponentName("com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity")
+                    intent.component = ComponentName(
+                        "com.huawei.systemmanager",
+                        "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity"
+                    )
                 }
+
                 else -> return
             }
             startActivity(intent)
         } catch (e: Exception) {
             Log.e("MainActivity", "Failed to open OEM autostart for $manufacturer: ${e.message}")
+        }
+    }
+
+    @SuppressLint("BatteryLife")
+    private fun requestBatteryExemption() {
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (!powerManager.isIgnoringBatteryOptimizations(packageName)) {
+            try {
+                val intent =
+                    Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = "package:$packageName".toUri()
+                    }
+                startActivity(intent)
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Failed to launch battery settings: ${e.message}")
+            }
         }
     }
 }

@@ -55,13 +55,11 @@ dependencies {
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
-    // Nordic BLE: The gold standard for stable Android Bluetooth
+
     implementation("no.nordicsemi.android:ble:2.11.0")
 
-    // OkHttp: For sending data to your web server
     implementation("com.squareup.okhttp3:okhttp:5.3.2")
 
-    // Accompanist: Makes asking for permissions in Compose much easier
     implementation("com.google.accompanist:accompanist-permissions:0.37.3")
 
 }

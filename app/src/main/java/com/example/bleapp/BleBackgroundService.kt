@@ -1,5 +1,6 @@
 package com.example.bleapp
 
+import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
@@ -13,7 +14,6 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
-import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -27,7 +27,15 @@ import kotlinx.coroutines.sync.withLock
 import okhttp3.FormBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import android.os.Build
 import java.util.concurrent.TimeUnit
+import no.nordicsemi.android.ble.observer.ConnectionObserver
+import android.bluetooth.BluetoothDevice
+import android.app.AlarmManager
+import android.app.PendingIntent
+import android.os.SystemClock
+import androidx.annotation.RequiresPermission
+import androidx.core.content.edit
 
 class BleBackgroundService : Service() {
 
@@ -45,6 +53,7 @@ class BleBackgroundService : Service() {
         .connectTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(false)
         .build()
 
     private val bluetoothStateReceiver = object : BroadcastReceiver() {
@@ -69,6 +78,24 @@ class BleBackgroundService : Service() {
         super.onCreate()
         createNotificationChannel()
         bleManager = NiclaBleManager(this)
+
+        bleManager.setConnectionObserver(object : ConnectionObserver {
+            override fun onDeviceConnecting(device: BluetoothDevice) {}
+            override fun onDeviceConnected(device: BluetoothDevice) {}
+            override fun onDeviceFailedToConnect(device: BluetoothDevice, reason: Int) {
+                Log.e("BLE", "Failed to connect. Reason: $reason")
+
+                serviceScope.launch {
+                    kotlinx.coroutines.delay(5000)
+                    connectToNicla()
+                }
+            }
+            override fun onDeviceReady(device: BluetoothDevice) {}
+            override fun onDeviceDisconnecting(device: BluetoothDevice) {}
+            override fun onDeviceDisconnected(device: BluetoothDevice, reason: Int) {
+                connectToNicla()
+            }
+        })
 
         registerReceiver(bluetoothStateReceiver, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED))
 
@@ -101,27 +128,63 @@ class BleBackgroundService : Service() {
                         dataBuffer.clear()
                         receivedBytes = 0
 
-                        sendDataToGoogleNative("${deviceId}_Battery", battLevel.toString(), "")
+                        sendOrCache("${deviceId}_Battery", battLevel.toString(), "")
+
+                        if (bytes.size > 9) {
+                            for (i in 9 until bytes.size) {
+                                dataBuffer.add(bytes[i].toInt() and 0xFF)
+                                receivedBytes++
+                            }
+                        }
                     } else {
                         for (byte in bytes) {
                             dataBuffer.add(byte.toInt() and 0xFF)
                             receivedBytes++
                         }
+                    }
 
-                        if (receivedBytes >= expectedBytes && expectedBytes > 0) {
-                            val csv = dataBuffer.joinToString(",")
-                            val steps = currentTotalSteps.toString()
+                    if (receivedBytes >= expectedBytes && expectedBytes > 0) {
+                        val csv = dataBuffer.joinToString(",")
+                        val steps = currentTotalSteps.toString()
 
-                            saveToLocalCache(deviceId, steps, csv)
-                            bleManager.sendAck()
-                            uploadCachedData()
+                        sendOrCache(deviceId, steps, csv)
+                        bleManager.sendAck()
 
-                            expectedBytes = 0
-                            receivedBytes = 0
-                            dataBuffer.clear()
-                        }
+                        expectedBytes = 0
+                        receivedBytes = 0
+                        dataBuffer.clear()
                     }
                 }
+            }
+        }
+    }
+
+    private fun sendOrCache(sheetName: String, steps: String, csv: String) {
+        val webhookUrl = getSharedPreferences("NiclaPrefs", MODE_PRIVATE).getString("SERVER_URL", "") ?: return
+        if (webhookUrl.isEmpty()) return
+
+        serviceScope.launch {
+            try {
+                val body = FormBody.Builder()
+                    .add("sheetName", sheetName)
+                    .add("steps", steps)
+                    .add("logData", csv)
+                    .build()
+
+                val request = Request.Builder().url(webhookUrl).post(body).build()
+
+                httpClient.newCall(request).execute().use { response ->
+                    val responseBody = response.body.string()
+                    Log.d("BleService", "Direct send HTTP ${response.code} body=$responseBody")
+
+                    if (!response.isSuccessful) {
+                        Log.w("BleService", "Server rejected, caching payload...")
+                        saveToLocalCache(sheetName, steps, csv)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("BleService", "Direct send failed, caching: ${e.message}")
+                saveToLocalCache(sheetName, steps, csv)
             }
         }
     }
@@ -130,16 +193,14 @@ class BleBackgroundService : Service() {
         val cachePrefs = getSharedPreferences("NiclaCache", MODE_PRIVATE)
         val timestamp = System.currentTimeMillis().toString()
         val payload = "$sheetName|$steps|$csv"
-        cachePrefs.edit().putString(timestamp, payload).apply()
+        cachePrefs.edit { putString(timestamp, payload) }
     }
 
     private fun uploadCachedData() {
         val webhookUrl = getSharedPreferences("NiclaPrefs", MODE_PRIVATE).getString("SERVER_URL", "") ?: return
 
         serviceScope.launch {
-            if (!uploadMutex.tryLock()) return@launch
-
-            try {
+            uploadMutex.withLock {
                 val cachePrefs = getSharedPreferences("NiclaCache", MODE_PRIVATE)
                 val allEntries = cachePrefs.all
 
@@ -160,36 +221,18 @@ class BleBackgroundService : Service() {
                             val request = Request.Builder().url(webhookUrl).post(body).build()
 
                             httpClient.newCall(request).execute().use { response ->
+                                val responseBody = response.body.string()
+                                Log.d("BleService", "Cache drain HTTP ${response.code} for $timestamp body=$responseBody")
+
                                 if (response.isSuccessful) {
-                                    cachePrefs.edit().remove(timestamp).apply()
+                                    cachePrefs.edit { remove(timestamp) }
                                 }
                             }
                         } catch (e: Exception) {
-                            Log.e("BleService", "Network Error: ${e.message}")
+                            Log.e("BleService", "Cache Network Error: ${e.message}")
                         }
                     }
                 }
-            } finally {
-                uploadMutex.unlock()
-            }
-        }
-    }
-
-    private fun sendDataToGoogleNative(sheetName: String, steps: String, csv: String) {
-        val webhookUrl = getSharedPreferences("NiclaPrefs", MODE_PRIVATE).getString("SERVER_URL", "") ?: return
-        if (webhookUrl.isEmpty()) return
-
-        serviceScope.launch {
-            try {
-                val body = FormBody.Builder()
-                    .add("sheetName", sheetName)
-                    .add("steps", steps)
-                    .add("logData", csv)
-                    .build()
-                val request = Request.Builder().url(webhookUrl).post(body).build()
-                httpClient.newCall(request).execute().use { }
-            } catch (e: Exception) {
-                Log.e("BleService", "Native Network Error: ${e.message}")
             }
         }
     }
@@ -240,17 +283,15 @@ class BleBackgroundService : Service() {
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                "NICLA_CHANNEL",
-                "System Sync",
-                NotificationManager.IMPORTANCE_MIN
-            ).apply {
-                description = "Maintains silent background connection."
-                setShowBadge(false)
-            }
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        val channel = NotificationChannel(
+            "NICLA_CHANNEL",
+            "System Sync",
+            NotificationManager.IMPORTANCE_MIN
+        ).apply {
+            description = "Maintains silent background connection."
+            setShowBadge(false)
         }
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
     override fun onDestroy() {
@@ -259,9 +300,40 @@ class BleBackgroundService : Service() {
         unregisterReceiver(bluetoothStateReceiver)
         try {
             connectivityManager.unregisterNetworkCallback(networkCallback)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
         }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    @RequiresPermission(Manifest.permission.SCHEDULE_EXACT_ALARM)
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        val restartServiceIntent = Intent(applicationContext, BleBackgroundService::class.java).also {
+            it.setPackage(packageName)
+        }
+
+        val restartServicePendingIntent: PendingIntent = PendingIntent.getService(
+            this, 1, restartServiceIntent,
+            PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val alarmService: AlarmManager = getSystemService(ALARM_SERVICE) as AlarmManager
+
+        try {
+            alarmService.setExactAndAllowWhileIdle(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                SystemClock.elapsedRealtime() + 1000,
+                restartServicePendingIntent
+            )
+        } catch (e: SecurityException) {
+            Log.e("BleService", "Exact alarm denied, falling back to inexact.", e)
+            alarmService.set(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                SystemClock.elapsedRealtime() + 1000,
+                restartServicePendingIntent
+            )
+        }
+
+        super.onTaskRemoved(rootIntent)
+    }
 }
