@@ -23,38 +23,38 @@ and the other will show you a csv with the steps taken every minute.
 
 GOOGLE SCRIPT
 
-// Paste your Spreadsheet ID right here inside the quotes
-// This ID can be obtained by creating a google sheet and getting the ID of the sheet
-var TARGET_SPREADSHEET_ID = "";
-
-function doPost(e) {
-  try {
-    var doc = SpreadsheetApp.openById(TARGET_SPREADSHEET_ID);
-
-    var incomingSheetName = e.parameter.sheetName;
-    var totalSteps = e.parameter.steps;
-    var csvLog = "'" + e.parameter.logData;
-    var captureTime = e.parameter.captureTime;
-    var timestamp = captureTime ? new Date(Number(captureTime)) : new Date();
-
-    if (!incomingSheetName) {
-        incomingSheetName = "Unknown_Device";
+    // Paste your Spreadsheet ID right here inside the quotes
+    // This ID can be obtained by creating a google sheet and getting the ID of the sheet
+    var TARGET_SPREADSHEET_ID = "";
+    
+    function doPost(e) {
+      try {
+        var doc = SpreadsheetApp.openById(TARGET_SPREADSHEET_ID);
+    
+        var incomingSheetName = e.parameter.sheetName;
+        var totalSteps = e.parameter.steps;
+        var csvLog = "'" + e.parameter.logData;
+        var captureTime = e.parameter.captureTime;
+        var timestamp = captureTime ? new Date(Number(captureTime)) : new Date();
+    
+        if (!incomingSheetName) {
+            incomingSheetName = "Unknown_Device";
+        }
+    
+        var sheet = doc.getSheetByName(incomingSheetName);
+    
+        if (!sheet) {
+          sheet = doc.insertSheet(incomingSheetName);
+          sheet.appendRow(["Timestamp", "Total Steps", "Minute Log (CSV)"]);
+          sheet.getRange("A1:C1").setFontWeight("bold");
+        }
+    
+        sheet.appendRow([timestamp, totalSteps, csvLog]);
+    
+        return ContentService.createTextOutput("Success: Written to " + incomingSheetName);
+        
+      } catch(error) {
+        return ContentService.createTextOutput("Error: " + error.toString());
+      }
     }
-
-    var sheet = doc.getSheetByName(incomingSheetName);
-
-    if (!sheet) {
-      sheet = doc.insertSheet(incomingSheetName);
-      sheet.appendRow(["Timestamp", "Total Steps", "Minute Log (CSV)"]);
-      sheet.getRange("A1:C1").setFontWeight("bold");
-    }
-
-    sheet.appendRow([timestamp, totalSteps, csvLog]);
-
-    return ContentService.createTextOutput("Success: Written to " + incomingSheetName);
-
-  } catch(error) {
-    return ContentService.createTextOutput("Error: " + error.toString());
-  }
-}
-
+  
