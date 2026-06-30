@@ -26,7 +26,7 @@ You can get the app in one of two ways:
    - The **URL** of the server where the data will be sent.
    - The **MAC address** of the Arduino you're receiving data from.
 
-> 📡 A built-in MAC address scanner is planned, so you won't need a separate app to find the device address.
+> A built-in MAC address scanner is planned, so you won't need a separate app to find the device address.
 
 ## Testing without your own server
 
