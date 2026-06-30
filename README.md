@@ -1,60 +1,82 @@
-This repository contains the code for building an android app that receives steps from an Arduino Nicla Sense Me and posts to a web server.
+# Nicla BLE App
 
-Pre-requisites
+An Android app that receives step data from an **Arduino Nicla Sense ME** over Bluetooth Low Energy and posts it to a web server.
 
-  1. An Android phone with the app installed.
-  2. An Arduino Nicla Sense Me with the code in this repository (https://github.com/amartinram/Nicla-Step-Counter/tree/testLowLevel) flashed.
+> This is the Android half of a two-part project. The Nicla firmware lives here: **[Nicla-Step-Counter](https://github.com/amartinram/Nicla-Step-Counter/tree/testLowLevel)**
 
+## Prerequisites
 
-Functionality
+- An Android phone with this app installed.
+- An Arduino Nicla Sense ME flashed with the [Nicla-Step-Counter firmware](https://github.com/amartinram/Nicla-Step-Counter/tree/testLowLevel).
 
-The app can be installed by building the code in this repository or by downloading the app-debug.apk that can be found also in this repository.
-Note: Check if the last commit of the app-debug.apk matches the last commit of code to be on pair with the latest fixes.
+## Installation
 
-Once the app is installed, you will have to accept the permits that the app asks you and disable battery optimization and kill in background, this
-will prevent Android from killing the app. After that the app, will ask you to choose the URL of the server where you will see the data and the MAC
-address of the Arduino you are receiving the data from.
-Note: A MAC address scanner will be added later in order to centralize everything and not having to install another app to check the address.
+You can get the app in one of two ways:
 
-If you dont have a web server that parses the bytes received from the Arduino you can test the App and the Arduino with the google script below.
+- **Build from source** using the code in this repository, or
+- **Download the prebuilt APK** (`app-debug.apk`) included in the repo.
 
-Once the google server is running you can click connect in the App and two spreadsheets will appear, one will show you the battery remaining in the Arduino (it dies at 70%)
-and the other will show you a csv with the steps taken every minute.
+> If you use the prebuilt APK, check that its last commit matches the last commit of the source code, so you're running the latest fixes.
 
-GOOGLE SCRIPT
+## Setup
 
-    // Paste your Spreadsheet ID right here inside the quotes
-    // This ID can be obtained by creating a google sheet and getting the ID of the sheet
-    var TARGET_SPREADSHEET_ID = "";
-    
-    function doPost(e) {
-      try {
-        var doc = SpreadsheetApp.openById(TARGET_SPREADSHEET_ID);
-    
-        var incomingSheetName = e.parameter.sheetName;
-        var totalSteps = e.parameter.steps;
-        var csvLog = "'" + e.parameter.logData;
-        var captureTime = e.parameter.captureTime;
-        var timestamp = captureTime ? new Date(Number(captureTime)) : new Date();
-    
-        if (!incomingSheetName) {
-            incomingSheetName = "Unknown_Device";
-        }
-    
-        var sheet = doc.getSheetByName(incomingSheetName);
-    
-        if (!sheet) {
-          sheet = doc.insertSheet(incomingSheetName);
-          sheet.appendRow(["Timestamp", "Total Steps", "Minute Log (CSV)"]);
-          sheet.getRange("A1:C1").setFontWeight("bold");
-        }
-    
-        sheet.appendRow([timestamp, totalSteps, csvLog]);
-    
-        return ContentService.createTextOutput("Success: Written to " + incomingSheetName);
-        
-      } catch(error) {
-        return ContentService.createTextOutput("Error: " + error.toString());
-      }
+1. Install the app and grant all requested permissions.
+2. Disable **battery optimization** and **kill in background** for the app — this stops Android from terminating it.
+3. When prompted, enter:
+   - The **URL** of the server where the data will be sent.
+   - The **MAC address** of the Arduino you're receiving data from.
+
+> 📡 A built-in MAC address scanner is planned, so you won't need a separate app to find the device address.
+
+## Testing without your own server
+
+If you don't have a web server set up to parse the bytes from the Arduino, you can test the full app + Arduino flow using the Google Apps Script below.
+
+Once the script is deployed and running, tap **Connect** in the app. Two sheets will be created:
+
+- **Battery** — the Arduino's remaining battery (note: it dies at 70%).
+- **Steps** — a CSV of the steps taken each minute.
+
+### Setting up the Google Apps Script
+
+1. Create a Google Sheet and copy its **Spreadsheet ID** (the long string in the sheet's URL).
+2. In the sheet, open **Extensions → Apps Script** and paste the code below.
+3. Set `TARGET_SPREADSHEET_ID` to the ID you copied.
+4. Deploy via **Deploy → New deployment → Web app**, then use the resulting URL as the server URL in the app.
+
+```javascript
+// Paste your Spreadsheet ID right here inside the quotes
+// This ID can be obtained by creating a google sheet and getting the ID of the sheet
+var TARGET_SPREADSHEET_ID = "";
+
+function doPost(e) {
+  try {
+    var doc = SpreadsheetApp.openById(TARGET_SPREADSHEET_ID);
+
+    var incomingSheetName = e.parameter.sheetName;
+    var totalSteps = e.parameter.steps;
+    var csvLog = "'" + e.parameter.logData;
+    var captureTime = e.parameter.captureTime;
+    var timestamp = captureTime ? new Date(Number(captureTime)) : new Date();
+
+    if (!incomingSheetName) {
+        incomingSheetName = "Unknown_Device";
     }
-  
+
+    var sheet = doc.getSheetByName(incomingSheetName);
+
+    if (!sheet) {
+      sheet = doc.insertSheet(incomingSheetName);
+      sheet.appendRow(["Timestamp", "Total Steps", "Minute Log (CSV)"]);
+      sheet.getRange("A1:C1").setFontWeight("bold");
+    }
+
+    sheet.appendRow([timestamp, totalSteps, csvLog]);
+
+    return ContentService.createTextOutput("Success: Written to " + incomingSheetName);
+
+  } catch(error) {
+    return ContentService.createTextOutput("Error: " + error.toString());
+  }
+}
+```
