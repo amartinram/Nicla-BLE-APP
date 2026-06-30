@@ -60,6 +60,4 @@ dependencies {
 
     implementation("com.squareup.okhttp3:okhttp:5.3.2")
 
-    implementation("com.google.accompanist:accompanist-permissions:0.37.3")
-
 }

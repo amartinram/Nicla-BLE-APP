@@ -1,6 +1,5 @@
 package com.example.bleapp
 
-import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
@@ -27,25 +26,24 @@ import kotlinx.coroutines.sync.withLock
 import okhttp3.FormBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import android.os.Build
 import java.util.concurrent.TimeUnit
 import no.nordicsemi.android.ble.observer.ConnectionObserver
 import android.bluetooth.BluetoothDevice
 import android.app.AlarmManager
 import android.app.PendingIntent
 import android.os.SystemClock
-import androidx.annotation.RequiresPermission
 import androidx.core.content.edit
 
 class BleBackgroundService : Service() {
 
     private lateinit var bleManager: NiclaBleManager
-    private val packetMutex = Mutex()
     private val uploadMutex = Mutex()
     private val dataBuffer = mutableListOf<Int>()
     private var expectedBytes = 0
     private var receivedBytes = 0
     private var currentTotalSteps = 0L
+
+    private var currentBatteryLevel = 0
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -107,93 +105,99 @@ class BleBackgroundService : Service() {
 
         uploadCachedData()
 
-        val prefs = getSharedPreferences("NiclaPrefs", MODE_PRIVATE)
-
         bleManager.onDataReceived = { bytes ->
-            val rawMac = prefs.getString("PAIRED_MAC", "Unknown_Device") ?: "Unknown_Device"
-            val deviceId = rawMac.replace(":", "_")
+            if (bytes.size >= 9 && bytes[0] == 0xAA.toByte() && bytes[1] == 0xBB.toByte()) {
+                expectedBytes = ((bytes[2].toInt() and 0xFF) shl 8) or (bytes[3].toInt() and 0xFF)
+                currentTotalSteps = ((bytes[4].toLong() and 0xFF) shl 24) or
+                        ((bytes[5].toLong() and 0xFF) shl 16) or
+                        ((bytes[6].toLong() and 0xFF) shl 8) or
+                        (bytes[7].toLong() and 0xFF)
 
-            serviceScope.launch {
-                packetMutex.withLock {
-                    if (bytes.size >= 9 && bytes[0] == 0xAA.toByte() && bytes[1] == 0xBB.toByte()) {
-                        expectedBytes = ((bytes[2].toInt() and 0xFF) shl 8) or (bytes[3].toInt() and 0xFF)
+                currentBatteryLevel = bytes[8].toInt() and 0xFF
 
-                        currentTotalSteps = ((bytes[4].toLong() and 0xFF) shl 24) or
-                                ((bytes[5].toLong() and 0xFF) shl 16) or
-                                ((bytes[6].toLong() and 0xFF) shl 8) or
-                                (bytes[7].toLong() and 0xFF)
+                dataBuffer.clear()
+                receivedBytes = 0
 
-                        val battLevel = bytes[8].toInt() and 0xFF
+                for (i in 9 until bytes.size) {
+                    dataBuffer.add(bytes[i].toInt() and 0xFF)
+                    receivedBytes++
+                }
+            } else {
+                for (byte in bytes) {
+                    dataBuffer.add(byte.toInt() and 0xFF)
+                    receivedBytes++
+                }
+            }
 
-                        dataBuffer.clear()
-                        receivedBytes = 0
+            if (expectedBytes > 0 && receivedBytes >= expectedBytes) {
 
-                        sendOrCache("${deviceId}_Battery", battLevel.toString(), "")
+                val captureTime = System.currentTimeMillis()
 
-                        if (bytes.size > 9) {
-                            for (i in 9 until bytes.size) {
-                                dataBuffer.add(bytes[i].toInt() and 0xFF)
-                                receivedBytes++
-                            }
-                        }
-                    } else {
-                        for (byte in bytes) {
-                            dataBuffer.add(byte.toInt() and 0xFF)
-                            receivedBytes++
-                        }
-                    }
+                val decodedBuckets = ArrayList<String>(dataBuffer.size)
+                for (stepCount in dataBuffer) {
+                    decodedBuckets.add(stepCount.toString())
+                }
 
-                    if (receivedBytes >= expectedBytes && expectedBytes > 0) {
-                        val csv = dataBuffer.joinToString(",")
-                        val steps = currentTotalSteps.toString()
+                val csv = decodedBuckets.joinToString(",")
+                val steps = currentTotalSteps.toString()
+                val battery = currentBatteryLevel.toString()
 
-                        sendOrCache(deviceId, steps, csv)
-                        bleManager.sendAck()
+                val rawMac = getSharedPreferences("NiclaPrefs", MODE_PRIVATE)
+                    .getString("PAIRED_MAC", "Unknown_Device") ?: "Unknown_Device"
+                val deviceId = rawMac.replace(":", "_")
 
-                        expectedBytes = 0
-                        receivedBytes = 0
-                        dataBuffer.clear()
-                    }
+                // ACK first so the device can power its radio down within its ACK timeout;
+                // the upload must not gate the ACK.
+                bleManager.sendAck()
+
+                expectedBytes = 0
+                receivedBytes = 0
+                dataBuffer.clear()
+
+                serviceScope.launch {
+                    uploadCachedData()
+                    sendOrCache("${deviceId}_Battery", battery, "", captureTime)
+                    kotlinx.coroutines.delay(1500)
+                    sendOrCache(deviceId, steps, csv, captureTime)
                 }
             }
         }
     }
 
-    private fun sendOrCache(sheetName: String, steps: String, csv: String) {
+    private fun sendOrCache(sheetName: String, steps: String, csv: String, captureTime: Long) {
         val webhookUrl = getSharedPreferences("NiclaPrefs", MODE_PRIVATE).getString("SERVER_URL", "") ?: return
         if (webhookUrl.isEmpty()) return
 
-        serviceScope.launch {
-            try {
-                val body = FormBody.Builder()
-                    .add("sheetName", sheetName)
-                    .add("steps", steps)
-                    .add("logData", csv)
-                    .build()
+        try {
+            val body = FormBody.Builder()
+                .add("sheetName", sheetName)
+                .add("steps", steps)
+                .add("logData", csv)
+                .add("captureTime", captureTime.toString())
+                .build()
 
-                val request = Request.Builder().url(webhookUrl).post(body).build()
+            val request = Request.Builder().url(webhookUrl).post(body).build()
 
-                httpClient.newCall(request).execute().use { response ->
-                    val responseBody = response.body.string()
-                    Log.d("BleService", "Direct send HTTP ${response.code} body=$responseBody")
+            httpClient.newCall(request).execute().use { response ->
+                val responseBody = response.body.string()
+                Log.d("BleService", "Direct send HTTP ${response.code} body=$responseBody")
 
-                    if (!response.isSuccessful) {
-                        Log.w("BleService", "Server rejected, caching payload...")
-                        saveToLocalCache(sheetName, steps, csv)
-                    }
+                if (!response.isSuccessful) {
+                    Log.w("BleService", "Server rejected, caching payload...")
+                    saveToLocalCache(sheetName, steps, csv, captureTime)
                 }
-            } catch (e: Exception) {
-                Log.e("BleService", "Direct send failed, caching: ${e.message}")
-                saveToLocalCache(sheetName, steps, csv)
             }
+        } catch (e: Exception) {
+            Log.e("BleService", "Direct send failed, caching: ${e.message}")
+            saveToLocalCache(sheetName, steps, csv, captureTime)
         }
     }
 
-    private fun saveToLocalCache(sheetName: String, steps: String, csv: String) {
+    private fun saveToLocalCache(sheetName: String, steps: String, csv: String, captureTime: Long) {
         val cachePrefs = getSharedPreferences("NiclaCache", MODE_PRIVATE)
-        val timestamp = System.currentTimeMillis().toString()
-        val payload = "$sheetName|$steps|$csv"
-        cachePrefs.edit { putString(timestamp, payload) }
+        val key = "${captureTime}_$sheetName"
+        val payload = "$captureTime|$sheetName|$steps|$csv"
+        cachePrefs.edit { putString(key, payload) }
     }
 
     private fun uploadCachedData() {
@@ -206,31 +210,34 @@ class BleBackgroundService : Service() {
 
                 if (webhookUrl.isEmpty() || allEntries.isEmpty()) return@launch
 
-                for ((timestamp, payloadRaw) in allEntries) {
+                for ((key, payloadRaw) in allEntries) {
                     val payload = payloadRaw as? String ?: continue
-                    val parts = payload.split("|", limit = 3)
+                    val parts = payload.split("|", limit = 4)
 
-                    if (parts.size == 3) {
+                    if (parts.size == 4) {
                         try {
                             val body = FormBody.Builder()
-                                .add("sheetName", parts[0])
-                                .add("steps", parts[1])
-                                .add("logData", parts[2])
+                                .add("captureTime", parts[0])
+                                .add("sheetName", parts[1])
+                                .add("steps", parts[2])
+                                .add("logData", parts[3])
                                 .build()
 
                             val request = Request.Builder().url(webhookUrl).post(body).build()
 
                             httpClient.newCall(request).execute().use { response ->
                                 val responseBody = response.body.string()
-                                Log.d("BleService", "Cache drain HTTP ${response.code} for $timestamp body=$responseBody")
+                                Log.d("BleService", "Cache drain HTTP ${response.code} for $key body=$responseBody")
 
                                 if (response.isSuccessful) {
-                                    cachePrefs.edit { remove(timestamp) }
+                                    cachePrefs.edit { remove(key) }
                                 }
                             }
                         } catch (e: Exception) {
                             Log.e("BleService", "Cache Network Error: ${e.message}")
                         }
+                    } else {
+                        cachePrefs.edit { remove(key) }
                     }
                 }
             }
@@ -261,6 +268,8 @@ class BleBackgroundService : Service() {
     }
 
     private fun connectToNicla() {
+        if (bleManager.isConnected) return
+
         val prefs = getSharedPreferences("NiclaPrefs", MODE_PRIVATE)
         val savedMac = prefs.getString("PAIRED_MAC", null)
 
@@ -306,7 +315,6 @@ class BleBackgroundService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    @RequiresPermission(Manifest.permission.SCHEDULE_EXACT_ALARM)
     override fun onTaskRemoved(rootIntent: Intent?) {
         val restartServiceIntent = Intent(applicationContext, BleBackgroundService::class.java).also {
             it.setPackage(packageName)
@@ -318,21 +326,11 @@ class BleBackgroundService : Service() {
         )
 
         val alarmService: AlarmManager = getSystemService(ALARM_SERVICE) as AlarmManager
-
-        try {
-            alarmService.setExactAndAllowWhileIdle(
-                AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                SystemClock.elapsedRealtime() + 1000,
-                restartServicePendingIntent
-            )
-        } catch (e: SecurityException) {
-            Log.e("BleService", "Exact alarm denied, falling back to inexact.", e)
-            alarmService.set(
-                AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                SystemClock.elapsedRealtime() + 1000,
-                restartServicePendingIntent
-            )
-        }
+        alarmService.setAndAllowWhileIdle(
+            AlarmManager.ELAPSED_REALTIME_WAKEUP,
+            SystemClock.elapsedRealtime() + 1000,
+            restartServicePendingIntent
+        )
 
         super.onTaskRemoved(rootIntent)
     }

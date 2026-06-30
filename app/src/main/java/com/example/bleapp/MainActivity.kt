@@ -44,10 +44,11 @@ class MainActivity : ComponentActivity() {
         requestPermissions()
 
         val prefs = getSharedPreferences("NiclaPrefs", Context.MODE_PRIVATE)
-        val isFirstRun = prefs.getBoolean("IS_FIRST_RUN", true)
 
-        if (isFirstRun) {
-            runFirstTimeSetup()
+        ensureBatteryExemption()
+
+        if (prefs.getBoolean("IS_FIRST_RUN", true)) {
+            requestUniversalAutoStart()
             prefs.edit { putBoolean("IS_FIRST_RUN", false) }
         }
 
@@ -83,7 +84,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @SuppressLint("BatteryLife")
-    private fun runFirstTimeSetup() {
+    private fun ensureBatteryExemption() {
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         if (!powerManager.isIgnoringBatteryOptimizations(packageName)) {
             try {
@@ -96,7 +97,6 @@ class MainActivity : ComponentActivity() {
                 Log.e("MainActivity", "Battery exemption intent failed: ${e.message}")
             }
         }
-        requestUniversalAutoStart()
     }
 
     private fun requestUniversalAutoStart() {
@@ -144,22 +144,6 @@ class MainActivity : ComponentActivity() {
             startActivity(intent)
         } catch (e: Exception) {
             Log.e("MainActivity", "Failed to open OEM autostart for $manufacturer: ${e.message}")
-        }
-    }
-
-    @SuppressLint("BatteryLife")
-    private fun requestBatteryExemption() {
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        if (!powerManager.isIgnoringBatteryOptimizations(packageName)) {
-            try {
-                val intent =
-                    Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                        data = "package:$packageName".toUri()
-                    }
-                startActivity(intent)
-            } catch (e: Exception) {
-                Log.e("MainActivity", "Failed to launch battery settings: ${e.message}")
-            }
         }
     }
 }
