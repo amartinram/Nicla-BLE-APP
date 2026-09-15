@@ -9,6 +9,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.SharedPreferences
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -36,6 +37,14 @@ import androidx.core.content.edit
 
 class BleBackgroundService : Service() {
 
+    companion object {
+        /**
+         * Upper bound on pending uploads, roughly a month at the two sent per
+         * day (the daily log and its battery reading). See [trimCache].
+         */
+        private const val MAX_CACHED_UPLOADS = 60
+    }
+
     private lateinit var bleManager: NiclaBleManager
     private val uploadMutex = Mutex()
     private val dataBuffer = mutableListOf<Int>()
@@ -48,9 +57,19 @@ class BleBackgroundService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     private val httpClient = OkHttpClient.Builder()
+        // The TCP handshake is answered by the host's edge immediately, so
+        // connecting and writing stay short.
         .connectTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
+        // Reading is the one that matters. The server runs on a free plan that
+        // stops after 15 minutes idle and takes ~50 s to start again, and this
+        // app uploads about once a day, so it often arrives at a stopped
+        // instance. At 30 s the first attempt timed out every time -- and the
+        // server had usually committed the row by then, so the retry stored the
+        // day a second time.
+        .readTimeout(120, TimeUnit.SECONDS)
+        // Overall ceiling so a request can never hang indefinitely.
+        .callTimeout(180, TimeUnit.SECONDS)
         .retryOnConnectionFailure(false)
         .build()
 
@@ -198,6 +217,35 @@ class BleBackgroundService : Service() {
         val key = "${captureTime}_$sheetName"
         val payload = "$captureTime|$sheetName|$steps|$csv"
         cachePrefs.edit { putString(key, payload) }
+        trimCache(cachePrefs)
+    }
+
+    /**
+     * Keeps the offline cache bounded.
+     *
+     * A cached entry is only removed once the server accepts it, so an upload
+     * the server keeps rejecting -- a wrong token in the URL, most likely --
+     * would otherwise accumulate forever and be retried on every network
+     * change. That matters because SharedPreferences is read into memory in
+     * full, and each daily log is several KB.
+     *
+     * Rejected uploads are still kept rather than dropped on the spot, so the
+     * data survives long enough to be recovered once the URL is corrected.
+     * Keys begin with the capture timestamp, so discarding the lowest keys
+     * discards the oldest data first.
+     */
+    private fun trimCache(cachePrefs: SharedPreferences) {
+        val keys = cachePrefs.all.keys
+        if (keys.size <= MAX_CACHED_UPLOADS) return
+
+        val oldestFirst = keys.sortedBy { it.substringBefore('_').toLongOrNull() ?: Long.MAX_VALUE }
+        val excess = keys.size - MAX_CACHED_UPLOADS
+        cachePrefs.edit {
+            for (key in oldestFirst.take(excess)) {
+                Log.w("BleService", "Cache at capacity, discarding oldest entry $key")
+                remove(key)
+            }
+        }
     }
 
     private fun uploadCachedData() {

@@ -161,12 +161,24 @@ fun TrackerScreen(viewModel: MainViewModel) {
     ) {
         Text("Nicla App", fontSize = 28.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 32.dp))
 
+        // Validated as you type: a bad URL or MAC otherwise fails silently,
+        // leaving the app looking connected while nothing reaches the doctor.
+        val urlError = MainViewModel.serverUrlError(serverUrl)
+        val urlWarning = MainViewModel.serverUrlWarning(serverUrl)
+        val macError = MainViewModel.macAddressError(macAddress)
+
         OutlinedTextField(
             value = serverUrl,
             onValueChange = { viewModel.setServerUrl(it) },
             label = { Text("URL servidor") },
             modifier = Modifier.fillMaxWidth(),
-            enabled = !isTracking
+            enabled = !isTracking,
+            isError = !isTracking && urlError != null,
+            singleLine = true,
+            supportingText = {
+                val message = urlError ?: urlWarning
+                if (message != null && !isTracking) Text(message)
+            }
         )
 
         Spacer(modifier = Modifier.height(16.dp))
@@ -176,13 +188,20 @@ fun TrackerScreen(viewModel: MainViewModel) {
             onValueChange = { viewModel.setMacAddress(it) },
             label = { Text("Direccion dispositivo Nicla (AA:BB:CC:DD:EE:FF)") },
             modifier = Modifier.fillMaxWidth(),
-            enabled = !isTracking
+            enabled = !isTracking,
+            isError = !isTracking && macError != null,
+            singleLine = true,
+            supportingText = { if (macError != null && !isTracking) Text(macError) }
         )
 
         Spacer(modifier = Modifier.height(32.dp))
 
         if (!isTracking) {
-            Button(onClick = { viewModel.startTracking() }, modifier = Modifier.fillMaxWidth().height(56.dp)) {
+            Button(
+                onClick = { viewModel.startTracking() },
+                enabled = urlError == null && macError == null,
+                modifier = Modifier.fillMaxWidth().height(56.dp)
+            ) {
                 Text("Guardar y Conectar", fontSize = 16.sp)
             }
         } else {
