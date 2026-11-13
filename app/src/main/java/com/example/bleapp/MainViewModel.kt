@@ -1,8 +1,11 @@
 package com.example.bleapp
 
+import android.Manifest
 import android.app.Application
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -47,6 +50,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val token = value.toHttpUrlOrNull()?.queryParameter("token")
             return if (token.isNullOrEmpty()) "Aviso: falta ?token=... en la URL" else null
         }
+
+        /**
+         * Whether the app may talk to the device at all. From Android 12 that
+         * is a runtime permission, and from Android 14 starting the
+         * connected-device foreground service without it is a crash, so every
+         * place that starts the service asks this first.
+         */
+        fun hasBluetoothPermission(context: Context): Boolean =
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+                ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) ==
+                PackageManager.PERMISSION_GRANTED
 
         /** Returns null when the MAC is usable, otherwise the reason it is not. */
         fun macAddressError(mac: String): String? {
@@ -95,7 +109,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         // Refuse rather than start a service that can only fail: without a
         // usable URL every upload would sit in the cache unsent.
-        if (!canStartTracking()) return
+        if (!canStartTracking() || !hasBluetoothPermission(context)) return
 
         if (mac.length == 17) {
             prefs.edit { putString("PAIRED_MAC", mac).putString("SAVED_MAC", mac) }

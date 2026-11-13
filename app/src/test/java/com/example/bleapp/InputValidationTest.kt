@@ -74,7 +74,7 @@ class InputValidationTest {
             "1757000000000_AA_BB",
             "1757000000000_AA_BB_Battery"
         )
-        val oldestFirst = keys.sortedBy { it.substringBefore('_').toLongOrNull() ?: Long.MAX_VALUE }
+        val oldestFirst = NiclaProtocol.oldestFirst(keys)
         assertEquals(1757000000000L, oldestFirst.first().substringBefore('_').toLong())
         assertEquals(1757086400000L, oldestFirst.last().substringBefore('_').toLong())
     }

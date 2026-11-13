@@ -20,7 +20,9 @@ import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -43,16 +45,53 @@ class BleBackgroundService : Service() {
          * day (the daily log and its battery reading). See [trimCache].
          */
         private const val MAX_CACHED_UPLOADS = 60
+
+        /**
+         * How long a finished step log waits for the gait log of the same day.
+         *
+         * The device sends the two back to back, about a second apart, so this
+         * only ever runs out when there is no gait block at all -- step-only
+         * firmware, or a day the device found no walking to analyse. Waiting
+         * costs nothing: the upload is independent of the BLE link, which the
+         * device drops as soon as it has its acknowledgements.
+         */
+        private const val GAIT_WAIT_MS = 10_000L
+
+        /** Uploads the server has not yet accepted. Removed only on a 2xx. */
+        private const val CACHE_PREFS = "NiclaCache"
+
+        /**
+         * The one day currently waiting for its gait log. Written before the
+         * step log is acknowledged, because the acknowledgement is what lets
+         * the device erase its own copy: from that moment this is the only
+         * one, and it must not live in memory alone.
+         */
+        private const val PENDING_PREFS = "NiclaPending"
+        private const val PENDING_DAY = "day"
+        private const val PENDING_BATTERY = "battery"
+
+        /** The last day received, so a resent day keeps its first timestamp. */
+        private const val LAST_DAY_KEY = "LAST_DAY_KEY"
+        private const val LAST_DAY_TIME = "LAST_DAY_TIME"
     }
 
     private lateinit var bleManager: NiclaBleManager
     private val uploadMutex = Mutex()
-    private val dataBuffer = mutableListOf<Int>()
-    private var expectedBytes = 0
-    private var receivedBytes = 0
-    private var currentTotalSteps = 0L
 
-    private var currentBatteryLevel = 0
+    /** Reassembles the dump from the notification stream. See NiclaProtocol. */
+    private val assembler = NiclaProtocol.Assembler()
+
+    // A finished step log, held just long enough for its gait log to arrive so
+    // the two reach the server as one reading. Guarded because the watchdog
+    // coroutine and the BLE callback both race to claim it.
+    private val pendingLock = Any()
+    private var pendingUpload: NiclaProtocol.Upload? = null
+    private var pendingBattery = ""
+    private var gaitWatchdog: Job? = null
+
+    // Retries the cache until it is empty. See scheduleRetry().
+    private val retryLock = Any()
+    private var retryJob: Job? = null
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -110,6 +149,8 @@ class BleBackgroundService : Service() {
             override fun onDeviceReady(device: BluetoothDevice) {}
             override fun onDeviceDisconnecting(device: BluetoothDevice) {}
             override fun onDeviceDisconnected(device: BluetoothDevice, reason: Int) {
+                // A block never continues across connections; see Assembler.reset().
+                assembler.reset()
                 connectToNicla()
             }
         })
@@ -122,102 +163,183 @@ class BleBackgroundService : Service() {
             .build()
         connectivityManager.registerNetworkCallback(networkRequest, networkCallback)
 
+        recoverPending()
         uploadCachedData()
 
-        bleManager.onDataReceived = { bytes ->
-            if (bytes.size >= 9 && bytes[0] == 0xAA.toByte() && bytes[1] == 0xBB.toByte()) {
-                expectedBytes = ((bytes[2].toInt() and 0xFF) shl 8) or (bytes[3].toInt() and 0xFF)
-                currentTotalSteps = ((bytes[4].toLong() and 0xFF) shl 24) or
-                        ((bytes[5].toLong() and 0xFF) shl 16) or
-                        ((bytes[6].toLong() and 0xFF) shl 8) or
-                        (bytes[7].toLong() and 0xFF)
+        bleManager.onDataReceived = { bytes -> onNotification(bytes) }
+    }
 
-                currentBatteryLevel = bytes[8].toInt() and 0xFF
+    /**
+     * One BLE notification. A dump arrives as a header followed by payload
+     * chunks, twice over: the step log, then the gait log for the same day.
+     * The device waits on an acknowledgement after each block.
+     *
+     * Each block is stored on disk BEFORE it is acknowledged. The device
+     * erases a day once it has its acknowledgements, so acknowledging first
+     * left a window -- the ten-second wait for the gait log, then an upload
+     * that can take minutes against a sleeping server -- in which the only
+     * copy of the day was in this process's memory, and a process Android
+     * killed in that window took the day with it. Storing is a few
+     * milliseconds, well inside the device's ten-second acknowledgement
+     * timeout; uploading still never gates the acknowledgement.
+     */
+    private fun onNotification(bytes: ByteArray) {
+        for (event in assembler.accept(bytes)) {
+            when (event) {
+                // A new day is starting. Anything still waiting for a gait log
+                // is never going to get one, so let it go now.
+                is NiclaProtocol.Assembler.Event.DayStarted -> flushPending()
 
-                dataBuffer.clear()
-                receivedBytes = 0
-
-                for (i in 9 until bytes.size) {
-                    dataBuffer.add(bytes[i].toInt() and 0xFF)
-                    receivedBytes++
-                }
-            } else {
-                for (byte in bytes) {
-                    dataBuffer.add(byte.toInt() and 0xFF)
-                    receivedBytes++
-                }
-            }
-
-            if (expectedBytes > 0 && receivedBytes >= expectedBytes) {
-
-                val captureTime = System.currentTimeMillis()
-
-                val decodedBuckets = ArrayList<String>(dataBuffer.size)
-                for (stepCount in dataBuffer) {
-                    decodedBuckets.add(stepCount.toString())
+                is NiclaProtocol.Assembler.Event.StepsComplete -> {
+                    holdForGait(event.header, event.csv, event.info)
+                    bleManager.sendAck()
                 }
 
-                val csv = decodedBuckets.joinToString(",")
-                val steps = currentTotalSteps.toString()
-                val battery = currentBatteryLevel.toString()
-
-                val rawMac = getSharedPreferences("NiclaPrefs", MODE_PRIVATE)
-                    .getString("PAIRED_MAC", "Unknown_Device") ?: "Unknown_Device"
-                val deviceId = rawMac.replace(":", "_")
-
-                // ACK first so the device can power its radio down within its ACK timeout;
-                // the upload must not gate the ACK.
-                bleManager.sendAck()
-
-                expectedBytes = 0
-                receivedBytes = 0
-                dataBuffer.clear()
-
-                serviceScope.launch {
-                    uploadCachedData()
-                    sendOrCache("${deviceId}_Battery", battery, "", captureTime)
-                    kotlinx.coroutines.delay(1500)
-                    sendOrCache(deviceId, steps, csv, captureTime)
+                is NiclaProtocol.Assembler.Event.GaitComplete -> {
+                    attachGait(event.header, event.csv)
+                    bleManager.sendAck()
                 }
             }
         }
     }
 
-    private fun sendOrCache(sheetName: String, steps: String, csv: String, captureTime: Long) {
-        val webhookUrl = getSharedPreferences("NiclaPrefs", MODE_PRIVATE).getString("SERVER_URL", "") ?: return
-        if (webhookUrl.isEmpty()) return
+    private fun deviceId(): String {
+        val rawMac = getSharedPreferences("NiclaPrefs", MODE_PRIVATE)
+            .getString("PAIRED_MAC", "Unknown_Device") ?: "Unknown_Device"
+        return rawMac.replace(":", "_")
+    }
 
-        try {
-            val body = FormBody.Builder()
-                .add("sheetName", sheetName)
-                .add("steps", steps)
-                .add("logData", csv)
-                .add("captureTime", captureTime.toString())
-                .build()
+    /**
+     * The timestamp a day is stored under.
+     *
+     * A device that reports how long the day waited gets the time the day
+     * actually ended. And a day the device is sending for the second time --
+     * it resends whenever an acknowledgement went missing -- gets the
+     * timestamp it had the first time, so the server recognises it as the
+     * same reading instead of storing the day twice.
+     */
+    private fun captureTimeFor(
+        header: NiclaProtocol.StepHeader, csv: String, info: NiclaProtocol.DayInfo?,
+    ): Long {
+        val now = System.currentTimeMillis()
+        if (info == null) return now
 
-            val request = Request.Builder().url(webhookUrl).post(body).build()
+        val prefs = getSharedPreferences("NiclaPrefs", MODE_PRIVATE)
+        val key = NiclaProtocol.dayKey(info, header, csv)
+        if (prefs.getString(LAST_DAY_KEY, null) == key) {
+            val first = prefs.getLong(LAST_DAY_TIME, 0L)
+            if (first > 0L) return first
+        }
+        val time = NiclaProtocol.captureTime(now, info)
+        prefs.edit { putString(LAST_DAY_KEY, key).putLong(LAST_DAY_TIME, time) }
+        return time
+    }
 
-            httpClient.newCall(request).execute().use { response ->
-                val responseBody = response.body.string()
-                Log.d("BleService", "Direct send HTTP ${response.code} body=$responseBody")
-
-                if (!response.isSuccessful) {
-                    Log.w("BleService", "Server rejected, caching payload...")
-                    saveToLocalCache(sheetName, steps, csv, captureTime)
-                }
+    /** Holds a finished step log just long enough for its gait log to arrive. */
+    private fun holdForGait(
+        header: NiclaProtocol.StepHeader, csv: String, info: NiclaProtocol.DayInfo?,
+    ) {
+        val day = NiclaProtocol.Upload(
+            captureTime = captureTimeFor(header, csv, info),
+            sheetName = deviceId(),
+            steps = header.totalSteps.toString(),
+            logData = csv,
+        )
+        val battery = header.battery.toString()
+        synchronized(pendingLock) {
+            pendingUpload = day
+            pendingBattery = battery
+            getSharedPreferences(PENDING_PREFS, MODE_PRIVATE).edit(commit = true) {
+                putString(PENDING_DAY, day.encode())
+                putString(PENDING_BATTERY, battery)
             }
-        } catch (e: Exception) {
-            Log.e("BleService", "Direct send failed, caching: ${e.message}")
-            saveToLocalCache(sheetName, steps, csv, captureTime)
+            gaitWatchdog?.cancel()
+            gaitWatchdog = serviceScope.launch {
+                delay(GAIT_WAIT_MS)
+                // Drop the handle before flushing, so claimPending() does not
+                // cancel the very coroutine it is running on.
+                synchronized(pendingLock) { gaitWatchdog = null }
+                flushPending()
+            }
         }
     }
 
-    private fun saveToLocalCache(sheetName: String, steps: String, csv: String, captureTime: Long) {
-        val cachePrefs = getSharedPreferences("NiclaCache", MODE_PRIVATE)
-        val key = "${captureTime}_$sheetName"
-        val payload = "$captureTime|$sheetName|$steps|$csv"
-        cachePrefs.edit { putString(key, payload) }
+    /**
+     * Queues the gait log together with the step log it belongs to, so the day
+     * reaches the server as a single reading rather than two half-rows.
+     */
+    private fun attachGait(header: NiclaProtocol.GaitHeader, csv: String) {
+        val claimed = claimPending()
+        if (claimed == null) {
+            Log.w("BleService", "Gait block with no step log to attach it to")
+            return
+        }
+        val (day, battery) = claimed
+        enqueue(day.copy(speedLog = csv, gait = header), battery)
+        uploadCachedData()
+    }
+
+    /** Takes the pending day, if it is still there. Only one caller can win. */
+    private fun claimPending(): Pair<NiclaProtocol.Upload, String>? = synchronized(pendingLock) {
+        val held = pendingUpload ?: return@synchronized null
+        pendingUpload = null
+        gaitWatchdog?.cancel()
+        gaitWatchdog = null
+        held to pendingBattery
+    }
+
+    /** Queues the pending day with no gait data, if one is still waiting. */
+    private fun flushPending() {
+        val (held, battery) = claimPending() ?: return
+        enqueue(held, battery)
+        uploadCachedData()
+    }
+
+    /**
+     * Moves a finished day, and the battery reading that came with it, into
+     * the upload cache. Everything is sent from the cache and removed from it
+     * only once the server has accepted it, so there is one path to the server
+     * and no moment at which a day exists only in memory.
+     */
+    private fun enqueue(day: NiclaProtocol.Upload, battery: String) {
+        val batteryReading = NiclaProtocol.Upload(day.captureTime, day.sheetName + "_Battery",
+                                                  battery, "")
+        val cachePrefs = getSharedPreferences(CACHE_PREFS, MODE_PRIVATE)
+        synchronized(pendingLock) {
+            cachePrefs.edit(commit = true) {
+                putString(cacheKey(batteryReading), batteryReading.encode())
+                putString(cacheKey(day), day.encode())
+            }
+            // The stored pending copy has done its job -- unless a newer day
+            // has already taken its place while this one was being queued.
+            if (pendingUpload == null) {
+                getSharedPreferences(PENDING_PREFS, MODE_PRIVATE).edit(commit = true) { clear() }
+            }
+        }
         trimCache(cachePrefs)
+    }
+
+    /**
+     * Picks up a day that was acknowledged to the device but never queued,
+     * because the process died while it was waiting for its gait log.
+     */
+    private fun recoverPending() {
+        val pending = getSharedPreferences(PENDING_PREFS, MODE_PRIVATE)
+        val day = pending.getString(PENDING_DAY, null)?.let { NiclaProtocol.decode(it) }
+        if (day != null) {
+            Log.w("BleService", "Recovering a day left unqueued by the previous run")
+            enqueue(day, pending.getString(PENDING_BATTERY, "") ?: "")
+        } else {
+            pending.edit { clear() }
+        }
+    }
+
+    private fun cacheKey(day: NiclaProtocol.Upload) = "${day.captureTime}_${day.sheetName}"
+
+    private fun formBodyFor(day: NiclaProtocol.Upload): FormBody {
+        val builder = FormBody.Builder()
+        for ((name, value) in day.formFields()) builder.add(name, value)
+        return builder.build()
     }
 
     /**
@@ -225,68 +347,89 @@ class BleBackgroundService : Service() {
      *
      * A cached entry is only removed once the server accepts it, so an upload
      * the server keeps rejecting -- a wrong token in the URL, most likely --
-     * would otherwise accumulate forever and be retried on every network
-     * change. That matters because SharedPreferences is read into memory in
-     * full, and each daily log is several KB.
+     * would otherwise accumulate forever. That matters because
+     * SharedPreferences is read into memory in full, and each daily log is
+     * several KB.
      *
      * Rejected uploads are still kept rather than dropped on the spot, so the
      * data survives long enough to be recovered once the URL is corrected.
-     * Keys begin with the capture timestamp, so discarding the lowest keys
-     * discards the oldest data first.
      */
     private fun trimCache(cachePrefs: SharedPreferences) {
         val keys = cachePrefs.all.keys
         if (keys.size <= MAX_CACHED_UPLOADS) return
 
-        val oldestFirst = keys.sortedBy { it.substringBefore('_').toLongOrNull() ?: Long.MAX_VALUE }
         val excess = keys.size - MAX_CACHED_UPLOADS
         cachePrefs.edit {
-            for (key in oldestFirst.take(excess)) {
+            for (key in NiclaProtocol.oldestFirst(keys).take(excess)) {
                 Log.w("BleService", "Cache at capacity, discarding oldest entry $key")
                 remove(key)
             }
         }
     }
 
+    /** Sends whatever is waiting, and keeps trying until none of it is. */
     private fun uploadCachedData() {
-        val webhookUrl = getSharedPreferences("NiclaPrefs", MODE_PRIVATE).getString("SERVER_URL", "") ?: return
-
         serviceScope.launch {
-            uploadMutex.withLock {
-                val cachePrefs = getSharedPreferences("NiclaCache", MODE_PRIVATE)
-                val allEntries = cachePrefs.all
+            if (!drainCache()) scheduleRetry()
+        }
+    }
 
-                if (webhookUrl.isEmpty() || allEntries.isEmpty()) return@launch
+    /**
+     * One pass over the cache, oldest day first.
+     *
+     * @return true when nothing is left waiting.
+     */
+    private suspend fun drainCache(): Boolean = uploadMutex.withLock {
+        val webhookUrl = getSharedPreferences("NiclaPrefs", MODE_PRIVATE)
+            .getString("SERVER_URL", "").orEmpty()
+        // Nothing can be sent without a URL, and retrying will not change that.
+        if (webhookUrl.isEmpty()) return@withLock true
 
-                for ((key, payloadRaw) in allEntries) {
-                    val payload = payloadRaw as? String ?: continue
-                    val parts = payload.split("|", limit = 4)
+        val cachePrefs = getSharedPreferences(CACHE_PREFS, MODE_PRIVATE)
+        val entries = cachePrefs.all
 
-                    if (parts.size == 4) {
-                        try {
-                            val body = FormBody.Builder()
-                                .add("captureTime", parts[0])
-                                .add("sheetName", parts[1])
-                                .add("steps", parts[2])
-                                .add("logData", parts[3])
-                                .build()
-
-                            val request = Request.Builder().url(webhookUrl).post(body).build()
-
-                            httpClient.newCall(request).execute().use { response ->
-                                val responseBody = response.body.string()
-                                Log.d("BleService", "Cache drain HTTP ${response.code} for $key body=$responseBody")
-
-                                if (response.isSuccessful) {
-                                    cachePrefs.edit { remove(key) }
-                                }
-                            }
-                        } catch (e: Exception) {
-                            Log.e("BleService", "Cache Network Error: ${e.message}")
-                        }
-                    } else {
+        for (key in NiclaProtocol.oldestFirst(entries.keys)) {
+            val day = (entries[key] as? String)?.let { NiclaProtocol.decode(it) }
+            if (day == null) {
+                Log.w("BleService", "Discarding unreadable cache entry $key")
+                cachePrefs.edit { remove(key) }
+                continue
+            }
+            try {
+                val request = Request.Builder().url(webhookUrl).post(formBodyFor(day)).build()
+                httpClient.newCall(request).execute().use { response ->
+                    val responseBody = response.body.string()
+                    Log.d("BleService", "Upload HTTP ${response.code} for $key body=$responseBody")
+                    if (response.isSuccessful) {
                         cachePrefs.edit { remove(key) }
                     }
+                }
+            } catch (e: Exception) {
+                // No network, or the server did not answer. The rest of the
+                // cache would fail the same way, each after its own timeout.
+                Log.e("BleService", "Upload failed, will retry: ${e.message}")
+                return@withLock false
+            }
+        }
+        cachePrefs.all.isEmpty()
+    }
+
+    /**
+     * Retries the cache on a backoff until it is empty.
+     *
+     * A failed upload used to wait for the next network change or the next
+     * day's dump, whichever came first. On a phone that sits on the same Wi-Fi
+     * that is a full day, during which the server sees nothing from a patient
+     * whose device is working, and raises a no-data alert for them.
+     */
+    private fun scheduleRetry() {
+        synchronized(retryLock) {
+            if (retryJob?.isActive == true) return
+            retryJob = serviceScope.launch {
+                var attempt = 0
+                while (true) {
+                    delay(NiclaProtocol.retryDelayMs(attempt++))
+                    if (drainCache()) break
                 }
             }
         }
@@ -353,6 +496,12 @@ class BleBackgroundService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        // A day still waiting for its gait log is already on disk, but queue
+        // it now so it goes out with the rest as soon as the service is back.
+        claimPending()?.let { (day, battery) ->
+            Log.w("BleService", "Service stopped mid-dump; queueing the day for later")
+            enqueue(day, battery)
+        }
         serviceScope.cancel()
         unregisterReceiver(bluetoothStateReceiver)
         try {

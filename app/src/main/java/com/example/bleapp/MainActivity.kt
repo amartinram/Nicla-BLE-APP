@@ -58,7 +58,7 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    TrackerScreen(viewModel)
+                    TrackerScreen(viewModel, onRequestPermissions = { requestPermissions() })
                 }
             }
         }
@@ -149,10 +149,12 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun TrackerScreen(viewModel: MainViewModel) {
+fun TrackerScreen(viewModel: MainViewModel, onRequestPermissions: () -> Unit = {}) {
     val serverUrl by viewModel.serverUrl.collectAsState()
     val macAddress by viewModel.macAddress.collectAsState()
     val isTracking by viewModel.isTracking.collectAsState()
+    val context = androidx.compose.ui.platform.LocalContext.current
+    var permissionMissing by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier.fillMaxSize().padding(24.dp),
@@ -198,11 +200,24 @@ fun TrackerScreen(viewModel: MainViewModel) {
 
         if (!isTracking) {
             Button(
-                onClick = { viewModel.startTracking() },
+                onClick = {
+                    // Without the Bluetooth permission the service cannot run
+                    // (and crashes on Android 14+), so ask again instead.
+                    permissionMissing = !MainViewModel.hasBluetoothPermission(context)
+                    if (permissionMissing) onRequestPermissions() else viewModel.startTracking()
+                },
                 enabled = urlError == null && macError == null,
                 modifier = Modifier.fillMaxWidth().height(56.dp)
             ) {
                 Text("Guardar y Conectar", fontSize = 16.sp)
+            }
+            if (permissionMissing) {
+                Text(
+                    "Concede el permiso de Bluetooth (dispositivos cercanos) y vuelve a pulsar.",
+                    color = MaterialTheme.colorScheme.error,
+                    fontSize = 13.sp,
+                    modifier = Modifier.padding(top = 8.dp)
+                )
             }
         } else {
             Button(

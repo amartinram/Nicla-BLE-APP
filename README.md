@@ -34,7 +34,7 @@ If you don't have a web server set up to parse the bytes from the Arduino, you c
 
 Once the script is deployed and running, tap **Connect** in the app. Two sheets will be created:
 
-- **Battery** — the Arduino's remaining battery (note: it dies at 70%).
+- **Battery** — the Arduino's battery gauge. It is cell voltage as a percentage of 4.2 V, not charge, which is why the device dies at about 70%. The [StepCounter server](https://github.com/amartinram/Nicla-WebServer) converts it to an estimated charge.
 - **Steps** — a CSV of the steps taken each minute.
 
 ### Setting up the Google Apps Script

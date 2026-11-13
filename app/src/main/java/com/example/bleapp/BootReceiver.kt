@@ -20,7 +20,10 @@ class BootReceiver : BroadcastReceiver() {
             val prefs = deviceContext.getSharedPreferences("NiclaPrefs", Context.MODE_PRIVATE)
             val savedMac = prefs.getString("PAIRED_MAC", null)
 
-            if (savedMac != null && savedMac.length == 17) {
+            if (!MainViewModel.hasBluetoothPermission(context)) {
+                // Starting the service without it would crash on Android 14+.
+                Log.w("BootReceiver", "Bluetooth permission missing; not starting the service.")
+            } else if (savedMac != null && savedMac.length == 17) {
                 Log.d("BootReceiver", "Nicla MAC found: $savedMac. Starting service...")
                 try {
                     val serviceIntent = Intent(context, BleBackgroundService::class.java)
